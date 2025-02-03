@@ -1,0 +1,1164 @@
+---
+title: "Onduo Dashboard - Preprocessing"
+author: "Damon Pettis"
+format: html
+editor: visual
+---
+
+# Packages
+
+```{r}
+
+pacman::p_load(pins, openxlsx, kableExtra, janitor, data.table, lubridate, tidyverse)
+pacman::p_load(DBI, RODBC, odbc, curl, httr, RCurl, tidyverse, dbplyr)
+
+```
+
+# Date Ranges
+
+```{r}
+
+three_months_ago <- Sys.Date() %m-% months(3)
+start_date <- "2021-01-01"
+
+```
+
+# Main Table Import
+
+```{r}
+board <- pins::board_connect()
+
+ENROLLED_MBRS_MASTER_VENDORS_mostUpdated <- pin_read(board, "hwang/ENROLLED_MBRS_MASTER_VENDORS_mostUpdated")
+
+
+ENROLLED_MBRS_ONDUO <- ENROLLED_MBRS_MASTER_VENDORS_mostUpdated %>% filter(VENDOR=='ONDUO')
+```
+
+We're taking members who were on the plan between 2023 to present
+
+```{r}
+
+```
+
+```{r}
+
+# ASEPSE_Active <- df_Monthly %>% 
+#   filter(TERMED == 0) %>% 
+#   filter(MONTH >= "2023-01-01") %>% 
+#   filter(COMPANYKEY == "21376" | COMPANYKEY == "21377") %>% 
+#   distinct(MEMBERID) %>% collect()
+```
+
+# Assign Member List
+
+```{r}
+# MBR_LIST <- ENROLLED_MBRS_ONDUO %>% distinct(MEMBER_ID) 
+
+MBR_LIST <- ENROLLED_MBRS_ONDUO %>% select(MEMBERID = MEMBER_ID) %>% distinct(MEMBERID)
+```
+
+```{r}
+
+MBR_LIST_Active <- ASEPSE_Active %>% distinct(MEMBERID)
+```
+
+# ID Ref Table
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+ID_ref <- tbl(con, in_catalog('PRD_DATASCIENCE_DB', 'HEALTHECON', 'BCBS_EID_MEMBERID_XREF')) %>% 
+  
+  # Joe's ID ref table is updated manually
+  # doing a right_join() so the we can correct the missing using the MEMBERID from the MBR_LIST... 
+  # ...as the MEMBERID and MASTER_ID in his table 
+  right_join(MBR_LIST, by = c("MEMBERID"="MEMBERID"), copy = TRUE) %>% collect() %>% 
+  
+  # CORRECTION: 
+   mutate(MASTER_ID = if_else(is.na(MASTER_ID), MEMBERID, MASTER_ID))
+
+```
+
+### Checks:
+
+These checks provided reason to do the right_join() instead of inner_join() for the ID_ref table. They should come back as empty when ran now.
+
+```{r}
+
+# Missing_in_ID_ref <- MBR_LIST %>% 
+#   anti_join(ID_ref, by = c("MEMBERID" = "MEMBERID"))
+# 
+# Missing_in_ID_ref
+# 
+# Missing_in_ID_ref_2.0 <- ASEPSE %>% 
+#   filter(MEMBERID %in% Missing_in_ID_ref$MEMBERID)
+# 
+# Missing_in_ID_ref_2.0 %>% view()
+# summary(Missing_in_ID_ref_2.0$FIRSTDATE)
+
+```
+
+# Main Table Cleaning
+
+Given this is a population health dashboard, I really only need the IDs as a main table for the AR Home population. Everything else can be pulled in the later sections. I'm keeping this separated and not merging this into another table like the Static or Mbr_Monthly because in the dashboard script there will be times (such as when doing the Utilization pages) when we won't need anything from those and will need to drop the extra variables.
+
+# Celeste Programs
+
+```{r}
+
+board <- board_connect()
+
+Celeste_Programs <- pin_read(board, "hwang/ENROLLED_MBRS_MASTER_VENDORS_mostUpdated") %>% 
+  select(MEMBER_ID, VENDOR, ENROLLMENT_START_DATE,ENROLLMENT_END_DATE) %>% 
+  filter(MEMBER_ID %in% MBR_LIST$MEMBERID) #%>% 
+  
+  # this part is done better on the Server side;
+  # if keep the format above we'll be able to populate the user input options for this more easily 
+    # mutate(flag = 1) %>% 
+    # pivot_wider(names_from = VENDOR, values_from = flag, values_fill = 0, values_fn = ~max(.x, na.rm = TRUE))
+  
+```
+
+# Maternity
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+Maternity <- tbl(con, in_catalog('PRD_DATASCIENCE_DB', 'HEALTHECON', 'BCBS_MATERNITY')) %>%  
+  
+  # use this if you don't want to carry the arrays; be sure to comment out the relocate() and rename() steps:
+  # select(-c(MEMBERID, PARTYKEY, MBR_EID)) %>% 
+  
+  # filter for the members we need (project members) using the MASTER_ID in the ID_REF table we filtered:
+  inner_join(ID_ref, by = "MASTER_ID", copy = TRUE) %>% 
+  
+  collect()
+  
+Maternity <- Maternity %>% 
+  
+  # correct spelling on unknown and spell out acronyms:
+  mutate(DELIVERY_TYPE = recode(DELIVERY_TYPE, "Cesarean" = "C-Section"),
+         OUTCOME = recode(OUTCOME, "ECT" = "Ectopic Pregnancy"),
+         OUTCOME = recode(OUTCOME, "IAB" = "Induced Abortion"),
+         OUTCOME = recode(OUTCOME, "LB" = "Live Birth"),
+         OUTCOME = recode(OUTCOME, "SAB" = "Spontaneous Abortion"),
+         OUTCOME = recode(OUTCOME, "SB" = "Still Birth"),
+         OUTCOME = if_else(is.na(OUTCOME), "Unknown", OUTCOME)
+  ) %>% 
+  
+  # create additonal columns for easy manipulation on server:
+  mutate(
+    DELIVERY = if_else(OUTCOME == "Live Birth" | OUTCOME == "Still Birth", 1, 0),
+    DELIVERY_LB = if_else(OUTCOME == "Live Birth", 1, 0),
+    DELIVERY_SB = if_else(OUTCOME == "Still Birth", 1, 0),
+    DELIVERY_VAGINAL = if_else((OUTCOME == "Live Birth" | OUTCOME == "Still Birth") & DELIVERY_TYPE == "Vaginal", 1, 0),
+    DELIVERY_CESAREAN = if_else((OUTCOME == "Live Birth" | OUTCOME == "Still Birth") & DELIVERY_TYPE == "C-Section", 1, 0),
+    DELIVERY_ABORTION = if_else(OUTCOME == "Spontaneous Abortion" | OUTCOME == "Induced Abortion", 1, 0),
+    DELIVERY_UNCOMP = if_else(DELIVERY_COMPLICATIONS == 1, 0, 1)
+  ) %>% 
+  
+  # correct dttm type on LMP:
+  mutate(LMP = as.Date(LMP)) %>% 
+  
+  # moving the columns up:
+  relocate(c(MEMBERID.y:MBR_EID.y), .after = MASTER_ID) %>% 
+
+  rename(MEMBERID = MEMBERID.y, 
+         MEMBERID_array = MEMBERID.x,
+         MBR_EID = MBR_EID.y,
+         MBR_EID_array = MBR_EID.x,
+         PARTYKEY_array = PARTYKEY,
+         PARTYKEY = PARTY_KEY)
+
+```
+
+# Care Management
+
+## Snowflake Connection
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+CONTACT_FORM <- tbl(con, in_catalog('PRD_RAW_DB','VDT_CM', 'ARBCBS_CONTACT_FORM'))
+FINALMEMBERETL <- tbl(con, in_catalog('PRD_RAW_DB','VDT_CM','FINALMEMBERETL'))
+```
+
+## Contact Monthly
+
+```{r}
+
+# ContactForms pull ----------
+# if you want weekly level instead of monthly, just replace 'month' by 'week' 
+# if you only want Maternity Program, then filter PROGRAM == 'Maternity'
+
+ 
+df_Contact_Form <- CONTACT_FORM %>%
+  
+  # Merge w/ FinalMemberETL to bring in IDs and other variables:
+  inner_join(FINALMEMBERETL, by = "MVDID") %>%
+  
+  # Grab out project focused members early so we aren't doing...
+  # all the aggregation below on members we don't need:
+  inner_join(MBR_LIST, by = "MEMBERID", copy = TRUE) %>% 
+  
+  # Clean dates and grab important columns:
+  mutate(Q1CONTACTDATE = sql("date_trunc('month', Q1CONTACTDATE)"),
+         FORMDATE = sql("date_trunc('month', FORMDATE)"),
+         ContactMonth = if_else(is.na(Q1CONTACTDATE), FORMDATE,Q1CONTACTDATE),
+         CONTACT_SUCCESS= if_else(Q7CONTACTSUCCESS=="Yes",1,0),
+         PROGRAM = Q2PROGRAM) %>%
+  
+  # Group and create Attempts/Success at member/monthly/program level:
+  group_by(MEMBERID, ContactMonth, PROGRAM, COMPANYKEY, CMORGREGION) %>%
+  summarise(CM_Attempt = n(),
+            CM_Success = sum(CONTACT_SUCCESS)) %>% 
+  
+  # Make sure the month is the correct format:
+  mutate(ContactMonth = as.Date(ContactMonth)) %>%
+  # filter(ContactMonth < floor_date(now(), unit ='month')) %>% 
+  
+  # Drop the last 3 months:
+  filter(ContactMonth <= three_months_ago) %>% 
+  
+  # Create the engagement columns:
+ # mutate() 
+  
+  ungroup()
+  
+
+  CM_Monthly <- df_Contact_Form %>% collect()
+  remove(df_Contact_Form)
+  
+  # Checks:
+  CM_Monthly
+  summary(CM_Monthly$ContactMonth)
+  
+```
+
+## Engagement Threshold
+
+This will give use the average, median, and upper quartile for successful contacts. Currently for this population, these all are sitting around 1.
+
+```{r}
+
+# Example data summarization
+engagement_metrics <- CM_Monthly %>%
+  group_by(MEMBERID, ContactMonth, PROGRAM) %>%
+  summarise(successful_calls = sum(CM_Success, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    avg_success = mean(successful_calls, na.rm = FALSE),
+    median_success = median(successful_calls, na.rm = FALSE),
+    p75_success = quantile(successful_calls, 0.75, na.rm = FALSE)
+  )
+
+# Define thresholds
+engaged_threshold <- engagement_metrics$median_calls
+highly_engaged_threshold <- engagement_metrics$p75_calls
+
+cat("Engaged Threshold:", engaged_threshold, "\n")
+cat("Highly Engaged Threshold (75th Percentile):", highly_engaged_threshold, "\n")
+
+
+```
+
+## Program Aggregation
+
+```{r}
+
+CM_Program_Level <- CM_Monthly %>% 
+  group_by(MEMBERID, PROGRAM) %>%
+  summarise(program_successful_calls = sum(CM_Success, na.rm = TRUE),
+            program_avg_success = round(mean(CM_Success, na.rm = FALSE),1),
+            program_median_success = round(median(CM_Success, na.rm = FALSE),1)
+            ) %>% 
+  ungroup()
+  
+CM_Program_Level
+
+```
+
+## Overall Aggregation
+
+```{r}
+
+CM_Overall_Level <- CM_Monthly %>% 
+  group_by(MEMBERID) %>%
+  summarise(overall_successful_calls = sum(CM_Success, na.rm = TRUE),
+            overall_avg_success = round(mean(CM_Success, na.rm = FALSE),1),
+            overall_median_success = round(median(CM_Success, na.rm = FALSE),1)
+            ) %>% 
+  ungroup()
+  
+CM_Overall_Level
+```
+
+## Combined
+
+```{r}
+
+CM_Monthly <- CM_Monthly %>% 
+  left_join(CM_Program_Level, by = c("MEMBERID", "PROGRAM")) %>% 
+  left_join(CM_Overall_Level, by = "MEMBERID")
+
+```
+
+# Utilization Wrangling
+
+## Snowflake Connection
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+
+df_CedarGate_MedClaims <- tbl(con, in_catalog('PRD_AR_INBOUND_DB', 'CEDAR_GATE','MEDICAL_CLAIMS'))
+
+
+```
+
+## IP Wrangling
+
+### Behavioral Health IP
+
+These claims focus only on Mental Health. These claims are pulled with DW_MEMBER_MATCH_STATUS == "Matched" & REV_ADJUDICATION_CLASS == "Paid" to ensure they
+
+```{r}
+  
+  df_BH_IP_Claims <- df_CedarGate_MedClaims %>% 
+  
+    # Apply filter criteria:
+    filter(ADMITTING_DIAG_SUPERGROUPER_DESC == 'Mental Health' & INPATIENTHOSPITALFLAG == 1 & 
+             DW_MEMBER_MATCH_STATUS == "Matched" & REV_ADJUDICATION_CLASS == "Paid") %>% 
+    filter(ADMISSION_START_DATE >= start_date & ADMISSION_START_DATE < three_months_ago) %>% 
+  
+    # Join with members:
+    inner_join(MBR_LIST, by = c("MBR_ID" = "MEMBERID"), copy = TRUE) %>% 
+  
+    # Bring only the desired columns:
+    select(MBR_ID, ADMISSIONID, INTEGER_CLAIM_NUMBER, 
+           REV_ALLOWED_AMT, REV_PAID_AMT,
+           INPATIENTHOSPITALFLAG, ADMISSION_START_DATE, ADMISSION_END_DATE, 
+           INPATIENTDAYS, SVC_SERVICE_FRM_DATE, SVC_SERVICE_TO_DATE, 
+           SVC_POS_CODE, SVC_POS_DESC, PLACEOFSERVICECATEGORY, CATEGORYDESCRIPTION,
+           ADMITTING_DIAG_SUPERGROUPER_DESC, ADMITTING_DIAG_GROUPER_DESC, SVC_ADMITTING_DIAG_DESC, MEDICAL_DIAG_DESC_CODE,
+           PRV_NPI, PRV_SPECIALTY_1_DESC, PRV_SPECIALTY_2_DESC, PRV_SPECIALTY_3_DESC
+           # REV_ADJUDICATION_CLASS, DW_MEMBER_MATCH_STATUS
+           )
+    
+  BH_IP_Claims <- df_BH_IP_Claims %>% collect() %>% arrange(MBR_ID, ADMISSIONID, SVC_SERVICE_FRM_DATE) %>% ungroup()
+  remove(df_BH_IP_Claims)
+
+  # Error checking:
+  BH_IP_Claims
+  BH_IP_Claims %>% get_dupes(MBR_ID)
+  BH_IP_Claims %>% get_dupes(MBR_ID, INTEGER_CLAIM_NUMBER)
+  BH_IP_Claims %>% get_dupes(MBR_ID, ADMISSIONID, SVC_SERVICE_FRM_DATE) %>% arrange(MBR_ID, SVC_SERVICE_FRM_DATE) 
+  
+  
+```
+
+### General IP (Physical + BH)
+
+Claims include mental and physical health
+
+```{r}
+
+  df_General_IP_Claims <- df_CedarGate_MedClaims %>% 
+  
+    # Apply filter criteria:
+    filter(INPATIENTHOSPITALFLAG == 1) %>% # deemed reliable
+    filter(DW_MEMBER_MATCH_STATUS == "Matched" & REV_ADJUDICATION_CLASS == "Paid") %>% 
+    filter(ADMISSION_START_DATE >= start_date & ADMISSION_START_DATE < three_months_ago) %>% 
+    
+    # Join with members:
+    inner_join(MBR_LIST, by = c("MBR_ID" = "MEMBERID"), copy = TRUE) %>% 
+  
+    # Bring only the desired columns:
+    select(MBR_ID, ADMISSIONID, INTEGER_CLAIM_NUMBER, 
+           REV_ALLOWED_AMT, REV_PAID_AMT,
+           INPATIENTHOSPITALFLAG, ADMISSION_START_DATE, ADMISSION_END_DATE, 
+           INPATIENTDAYS, SVC_SERVICE_FRM_DATE, SVC_SERVICE_TO_DATE, 
+           SVC_POS_CODE, SVC_POS_DESC, PLACEOFSERVICECATEGORY, CATEGORYDESCRIPTION,
+           ADMITTING_DIAG_SUPERGROUPER_DESC, ADMITTING_DIAG_GROUPER_DESC, SVC_ADMITTING_DIAG_DESC, MEDICAL_DIAG_DESC_CODE,
+           PRV_NPI, PRV_SPECIALTY_1_DESC, PRV_SPECIALTY_2_DESC, PRV_SPECIALTY_3_DESC
+           #REV_ADJUDICATION_CLASS, DW_MEMBER_MATCH_STATUS
+           )
+    
+  General_IP_Claims <- df_General_IP_Claims %>% collect() %>% arrange(MBR_ID, ADMISSIONID, SVC_SERVICE_FRM_DATE) %>% ungroup()
+  remove(df_General_IP_Claims)
+
+  # Error checking:
+  # General_IP_Claims
+  # General_IP_Claims %>% get_dupes(MBR_ID)
+  # General_IP_Claims %>% get_dupes(MBR_ID, INTEGER_CLAIM_NUMBER)
+  # General_IP_Claims %>% get_dupes(MBR_ID, ADMISSIONID, SVC_SERVICE_FRM_DATE) %>% arrange(MBR_ID, SVC_SERVICE_FRM_DATE) #%>% view()
+  # sum(is.na(General_IP_Claims$ADMISSIONID))
+
+```
+
+## ER Wrangling
+
+### Behavorial Health ER
+
+Currently only pulling ER visits based on the top 3 SUPERGROUPER_DESC but could expand or use a different column in the future. May need to double check if we need the distinct on MBR_ID and INTEGER_CLAIM_NUMBER
+
+```{r}
+
+  df_BH_ER_Claims <- df_CedarGate_MedClaims %>% 
+  
+    # Apply filter criteria:
+    filter((DIAG1_SUPERGROUPER_DESC == 'Mental Health' | DIAG2_SUPERGROUPER_DESC == 'Mental Health'| 
+              DIAG3_SUPERGROUPER_DESC == 'Mental Health') &
+              SVC_POS_CODE  == '23') %>% 
+    filter(DW_MEMBER_MATCH_STATUS == "Matched" & REV_ADJUDICATION_CLASS == "Paid") %>% 
+    filter(SVC_SERVICE_FRM_DATE >= start_date & SVC_SERVICE_FRM_DATE < three_months_ago) %>% 
+    
+    # Join with members:
+    distinct(MBR_ID, INTEGER_CLAIM_NUMBER, .keep_all = TRUE) %>%
+    inner_join(MBR_LIST, by = c("MBR_ID" = "MEMBERID"), copy = TRUE) %>% 
+    
+    # Bring only the desired columns:
+    select(MBR_ID, INTEGER_CLAIM_NUMBER, #IDs
+           SVC_SERVICE_FRM_DATE, SVC_SERVICE_TO_DATE, #dates
+           REV_ALLOWED_AMT, REV_PAID_AMT, #costs
+           MEDICAL_DIAG_DESC_CODE,
+           # ERVISIT, ER_VISITS,
+           SVC_POS_CODE, SVC_POS_DESC, PLACEOFSERVICECATEGORY, CATEGORYDESCRIPTION,
+           DIAG1_SUPERGROUPER_DESC, DIAG1_GROUPER_DESC,
+           DIAG2_SUPERGROUPER_DESC, DIAG2_GROUPER_DESC,
+           DIAG3_SUPERGROUPER_DESC, DIAG3_GROUPER_DESC,
+           PRV_NPI, PRV_SPECIALTY_1_DESC, PRV_SPECIALTY_2_DESC, PRV_SPECIALTY_3_DESC
+           # REV_ADJUDICATION_CLASS, DW_MEMBER_MATCH_STATUS
+           )
+    
+  BH_ER_Claims <- df_BH_ER_Claims %>% collect() %>% arrange(MBR_ID, INTEGER_CLAIM_NUMBER, SVC_SERVICE_FRM_DATE) #%>%  distinct(c(MBR_ID, SVC_SERVICE_FRM_DATE), .keep_all = TRUE)
+  remove(df_BH_ER_Claims)
+  
+  # Error checking:
+  # BH_ER_Claims
+  # tabyl(BH_ER_Claims$MEDICAL_DIAG_DESC_CODE) 
+  # tabyl(BH_ER_Claims$DIAG1_SUPERGROUPER_DESC) 
+  # 
+  # BH_ER_Claims %>% get_dupes(MBR_ID)
+  # #BH_ER_Claims %>% get_dupes(MBR_ID, INTEGER_CLAIM_NUMBER, ER_VISITS) %>% arrange(MBR_ID, INTEGER_CLAIM_NUMBER, SVC_SERVICE_FRM_DATE, ER_VISITS) #%>% view()
+  # BH_ER_Claims %>% get_dupes(MBR_ID, SVC_SERVICE_FRM_DATE) %>% arrange(MBR_ID, SVC_SERVICE_FRM_DATE) %>% view()
+  # 
+  # length(unique(BH_ER_Claims$MBR_ID))
+
+```
+
+### General ER (Physical + BH)
+
+```{r}
+
+  df_General_ER_Claims <- df_CedarGate_MedClaims %>% 
+  
+    # Apply filter criteria:
+    filter(SVC_POS_CODE  == '23') %>%  
+    filter(DW_MEMBER_MATCH_STATUS == "Matched" & REV_ADJUDICATION_CLASS == "Paid") %>% 
+    filter(SVC_SERVICE_FRM_DATE >= start_date & SVC_SERVICE_FRM_DATE < three_months_ago) %>% 
+    
+    # Join with members:
+    distinct(MBR_ID, INTEGER_CLAIM_NUMBER, .keep_all = TRUE) %>%
+    inner_join(MBR_LIST, by = c("MBR_ID" = "MEMBERID"), copy = TRUE) %>% 
+    
+    # Bring only the desired columns:
+    select(MBR_ID, INTEGER_CLAIM_NUMBER, #ID
+           SVC_SERVICE_FRM_DATE, SVC_SERVICE_TO_DATE, #dates
+           REV_ALLOWED_AMT, REV_PAID_AMT, #costs
+           MEDICAL_DIAG_DESC_CODE,
+           # ERVISIT, ER_VISITS,
+           SVC_POS_CODE, SVC_POS_DESC, PLACEOFSERVICECATEGORY, CATEGORYDESCRIPTION,
+           DIAG1_SUPERGROUPER_DESC, DIAG1_GROUPER_DESC,
+           DIAG2_SUPERGROUPER_DESC, DIAG2_GROUPER_DESC,
+           DIAG3_SUPERGROUPER_DESC, DIAG3_GROUPER_DESC,
+           PRV_NPI, PRV_SPECIALTY_1_DESC, PRV_SPECIALTY_2_DESC, PRV_SPECIALTY_3_DESC
+           # REV_ADJUDICATION_CLASS, DW_MEMBER_MATCH_STATUS
+           )
+    
+  General_ER_Claims <- df_General_ER_Claims %>% collect() %>% arrange(MBR_ID, INTEGER_CLAIM_NUMBER, SVC_SERVICE_FRM_DATE) %>% ungroup() #%>%  distinct(c(MBR_ID, SVC_SERVICE_FRM_DATE), .keep_all = TRUE)
+  remove(df_General_ER_Claims)
+  
+  # Error checking:
+  # Arisa_notMH_ER_Claims
+  # tabyl(Arisa_notMH_ER_Claims$MEDICAL_DIAG_DESC_CODE) 
+  # tabyl(Arisa_notMH_ER_Claims$DIAG1_SUPERGROUPER_DESC) 
+  # 
+  # Arisa_notMH_ER_Claims %>% get_dupes(MBR_ID)
+  # Arisa_notMH_ER_Claims %>% get_dupes(MBR_ID, INTEGER_CLAIM_NUMBER, ER_VISITS) %>% arrange(MBR_ID, INTEGER_CLAIM_NUMBER, SVC_SERVICE_FRM_DATE, ER_VISITS) #%>% view()
+  # Arisa_notMH_ER_Claims %>% get_dupes(MBR_ID, SVC_SERVICE_FRM_DATE) %>% arrange(MBR_ID, SVC_SERVICE_FRM_DATE) %>% view()
+  # 
+  # length(unique(Arisa_notMH_ER_Claims$MBR_ID))
+
+```
+
+# Static & Member Monthly
+
+## Snowflake Connection - Mbr Monthly
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+df_Monthly <- tbl(con, in_catalog('PRD_DATASCIENCE_DB', 'HEALTHECON', 'MEMBER_MONTHLY_COMPLETE'))
+
+```
+
+## Static Pin Import
+
+```{r}
+
+board <- pins::board_connect()
+Static <- pins::pin_read(board, "dmpettis/Master_Static") %>% 
+  filter(Mbr_ID %in% MBR_LIST$MEMBERID)
+
+```
+
+## Company Details Import
+
+```{r}
+
+board <- pins::board_connect()
+
+Company_Details <- pins::pin_read(board, "dmpettis/Company_Details")
+
+```
+
+## Static Prep
+
+```{r}
+
+# Filter Static for desired members:
+Static <- Static %>% 
+  filter(Mbr_ID %in% MBR_LIST$MEMBERID)
+
+Static <- Static %>% 
+  left_join(Company_Details, by = "Company_Key") %>% 
+  relocate(Company_Name, .after = Company_Key)
+
+```
+
+## Member Monthly
+
+```{r}
+
+Mbr_Monthly <- df_Monthly %>%
+  
+   # filter the dates down:
+  filter(MONTH >= start_date & MONTH <= three_months_ago) %>% 
+  
+  # create general flags to grab in the select statement:
+  mutate(DIABETES = if_else(DIABETES_CX == 1 | DIABETES_UNCX == 1,  1, 0),
+         CANCER = if_else(CANCER_LEUK == 1 | CANCER_LYMPH == 1 | CANCER_METS == 1 | CANCER_NSITU == 1 | CANCER_SOLID == 1, 
+                          1, 0),
+         SUD = if_else(ALCOHOL_ABUSE == 1 | NICOTINE == 1 | DRUG_ABUSE == 1, 1, 0),
+         HYPERTENSION = if_else(HYPERTENSION_CX == 1| HYPERTENSION_UNCX == 1, 1, 0),
+         RENAL = if_else(RENAL_MOD == 1 | RENAL_SEVERE == 1, 1, 0)
+  ) %>% 
+  
+  select(MEMBERID, MONTH, 
+         
+         # Costs used in the Overview Utilization line graphs:
+         ALLOWED, PAID, ALLOWED_PHARM, PAID_PHARM,
+         
+         # Used in the YOY Comparison:
+         CLAIMCOUNT,
+         
+         # Conditions used in the YOY Conditions Summary:
+         HYPERTENSION, HYPERTENSION_CX, HYPERTENSION_UNCX, 
+         HEART_FAILURE,
+         OBESITY, 
+         DIABETES, DIABETES_CX, DIABETES_UNCX, 
+         RENAL, RENAL_MOD, RENAL_SEVERE,
+         CANCER, 
+         BH, ANXIETY_STRESS_PTSD, DEPRESSION,
+         SUD, ALCOHOL_ABUSE, DRUG_ABUSE, NICOTINE,
+         STI
+         ) %>%
+  
+  # bring in member list:
+  right_join(MBR_LIST, by = c("MEMBERID" = "MEMBERID"), copy = TRUE) %>%
+  
+  collect() %>% 
+  
+  # Merge with DOB from Static table to create the Age based on the month listed in the member monthly;
+  # We'll make the Age Group within the Mbr_Monthly table from this because we use Age_Group in the YOY Characteristics Summary...
+  # ...on the Overview page and need a time component associated with the variable;
+  # We'll add but comment out the code needed for Generation and Age_Cat here;
+  # .... we won't need those 2 vars b/c we're not doing a YOY with these;
+  # The Characteristics PAGE will use the Static's Age, Age_Cat, Age_Group, and Generation...
+  # ... which would be a reflection of their current age;
+  
+  left_join(Static %>% select(Mbr_ID, DOB), by = c("MEMBERID" = "Mbr_ID"), copy = TRUE) %>% 
+  
+  # putting these variables in all caps to follow Joe's table format:
+  mutate(AGE = round(time_length(difftime(MONTH, DOB), "years")),
+           AGE_CAT = case_when(AGE >= 0 & AGE <= 2 ~ "Baby",
+                               AGE >= 3 & AGE <= 6 ~ "Young Child",
+                               AGE >= 7 & AGE <= 12 ~ "Child",
+                               AGE >= 13 & AGE <= 19 ~ "Teen",
+                               AGE >= 20 & AGE <= 30 ~ "Young Adult",
+                               AGE >= 31 & AGE <= 59 ~ "Adult",
+                               AGE >= 60 ~ "Senior")#,
+           # AGE_GROUP = case_when(AGE >= 0 & AGE <= 18 ~ "AGE [0-18]",
+           #                       AGE >= 19 & AGE <= 30 ~ "AGE [19-30]",
+           #                       AGE >= 31 & AGE <= 40 ~ "AGE [31-40]",
+           #                       AGE >= 41 & AGE <= 50 ~ "AGE [41-50]",
+           #                       AGE >= 51 & AGE <= 60 ~ "AGE [51-60]",
+           #                       AGE >= 60 ~ "AGE [>60]"),
+           # GENERATION = case_when(as.numeric(strtrim(DOB,4)) >= 1922 &  as.numeric(strtrim(DOB,4)) <= 1927 ~ "WWII",
+           #                        as.numeric(strtrim(DOB,4)) >= 1928 &  as.numeric(strtrim(DOB,4)) <= 1945 ~ "Post War",
+           #                        as.numeric(strtrim(DOB,4)) >= 1946 &  as.numeric(strtrim(DOB,4)) <= 1954 ~ "Boomers I",
+           #                        as.numeric(strtrim(DOB,4)) >= 1955 &  as.numeric(strtrim(DOB,4)) <= 1964 ~ "Boomers II",
+           #                        as.numeric(strtrim(DOB,4)) >= 1965 &  as.numeric(strtrim(DOB,4)) <= 1980 ~ "Gen X",
+           #                        as.numeric(strtrim(DOB,4)) >= 1981 &  as.numeric(strtrim(DOB,4)) <= 1996 ~ "Millenials",
+           #                        as.numeric(strtrim(DOB,4)) >= 1997 &  as.numeric(strtrim(DOB,4)) <= 2012 ~ "Gen Z",
+           #                        as.numeric(strtrim(DOB,4)) >= 2013 &  as.numeric(strtrim(DOB,4)) <= 2024 ~ "Gen Alpha",
+           #                        )
+         ) %>% 
+  
+  #replace NAs with Missing:
+  mutate(AGE_CAT = if_else(is.na(AGE_CAT), "Missing", AGE_CAT)) %>% 
+  
+   #Recode and factor vars:
+  mutate(AGE_CAT = factor(AGE_CAT, levels = c("Baby", "Child", "Young Child", "Teen", 
+                                              "Young Adult", "Adult","Senior","Missing")))
+
+```
+
+## Mbr Level
+
+This is just bringing the Joe's Member Monthly down to a member level so the conditions aren't tied to a specific time.
+
+```{r}
+
+Mbr_Level <- df_Monthly %>%
+  #filter(MONTH >= "2018-01-01" & MONTH < "2023-10-01") %>%
+  
+  right_join(MBR_LIST, by = c("MEMBERID" = "MEMBERID"), copy = TRUE) %>%
+  group_by(MEMBERID) %>%
+  summarise(
+    across(c("FIRSTDATE","LASTDATE","LASTDATE_RUNOUT","TERMED","SELF_FUND_CD"), ~max(.x)),
+    across(c('ER':'CLAIMCOUNT'), ~ sum(.x)),
+    #if you want to be more specific by adding "TOTAL" in the col name use below;
+    across(c('ALLOWED','PAID',"ALLOWED_PHARM","PAID_PHARM"), ~ sum(.x),.names = "TOTAL_{.col}"),
+    across(c('ALLOWED','PAID',"ALLOWED_PHARM","PAID_PHARM"), ~ mean(.x),.names = "AVG_{.col}"),
+    across(c('AIDS':'SYMPTOMS_SIGNS_ABNORMALITES'), ~ max(.x))) %>%
+  ungroup() %>%
+  collect()
+
+numCC_categorizer <- function(x){#x = NumCC
+    case_when(x==0 ~ "No Conditions", x ==1 ~ "1 Condition", x==2 ~ "2 Conditions",
+              x==3 ~ "3 Conditions", x >=4 ~ "4 or more Conditions", is.na(x) ~ "Missing")
+  }
+
+Mbr_Level <- Mbr_Level %>%
+  
+  # create general flags:
+  mutate(DIABETES = if_else(DIABETES_CX == 1 | DIABETES_UNCX == 1,  1, 0),
+         CANCER = if_else(CANCER_LEUK == 1 | CANCER_LYMPH == 1 | CANCER_METS == 1 | CANCER_NSITU == 1 | CANCER_SOLID == 1, 
+                          1, 0),
+         SUD = if_else(ALCOHOL_ABUSE == 1 | NICOTINE == 1 | DRUG_ABUSE == 1, 1, 0),
+         HYPERTENSION = if_else(HYPERTENSION_CX == 1| HYPERTENSION_UNCX == 1, 1, 0),
+         LIVER_DISEASE = if_else(LIVER_DISEASE_MILD == 1 | LIVER_DISEASE_SEVERE == 1, 1, 0),
+         RENAL = if_else(RENAL_MOD == 1 | RENAL_SEVERE == 1, 1, 0)
+  ) %>% 
+  
+  # create total condition count:
+  mutate(NUMCC = rowSums(select(.,AIDS,AUTOIMMUNE, BH, 
+                                CANCER_LEUK, CANCER_LYMPH, CANCER_METS, CANCER_NSITU, CANCER_SOLID,
+                                CEREBROVASCULAR_DISEASE, CHRONIC_PULMONARY_DISEASE, COVID_SEQUELAE, 
+                                DEMENTIA, DIABETES,
+                                HEART_FAILURE, HYPERTENSION, LIVER_DISEASE_MILD, LIVER_DISEASE_SEVERE,
+                                PARALYSIS, PEPTIC_ULCER, PERIPHERAL_CIRCULATION_DISEASE, PERIPHERAL_VASCULAR_DISEASE,
+                                RENAL, THYROID_HYPO, THYROID_OTHER, VALVULAR_DISEASE
+  ))) %>%
+  
+  # relocate columns for intuitive structure:
+  relocate(c(STI,PREGNANCY_CHILDBIRTH), .before = PREGNANCY_ECTOPIC) %>%
+  relocate(DIABETES, .before = DIABETES_CX) %>%
+  relocate(CANCER, .before = CANCER_LEUK) %>%
+  relocate(HYPERTENSION, .before = HYPERTENSION_CX) %>%
+  relocate(LIVER_DISEASE, .before = LIVER_DISEASE_MILD) %>%
+  relocate(RENAL, .before = RENAL_MOD) %>%
+  relocate(NUMCC, .before = AIDS) %>%
+  relocate(c(DEPRESSION, ANXIETY_STRESS_PTSD, PSYCHOSES, SUD, ALCOHOL_ABUSE, DRUG_ABUSE, NICOTINE), .after = BH) %>%
+  
+  # set flags so only the most complicated is flagged for a conditon:
+  mutate(DIABETES_UNCX = if_else(DIABETES_CX == 1, 0, DIABETES_UNCX),
+           LIVER_DISEASE_MILD = if_else(LIVER_DISEASE_SEVERE == 1, 0, LIVER_DISEASE_MILD),
+           RENAL_MOD = if_else(RENAL_SEVERE == 1, 0, RENAL_MOD),
+           CANCER_SOLID = if_else(CANCER_METS == 1, 0, CANCER_SOLID),
+           CANCER_NSITU = if_else(CANCER_SOLID == 1, 0, CANCER_NSITU)) %>%
+  
+  mutate(across(c(PREGNANCY_MISCARIAGE_CX, PREGNANCY_MISCARIAGE_UNCX, PREGNANCY_ONGOING_SEV_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_ECTOPIC == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_MISCARIAGE_UNCX, PREGNANCY_ONGOING_SEV_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_MISCARIAGE_CX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_ONGOING_SEV_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_MISCARIAGE_UNCX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_ECTOPIC:PREGNANCY_MISCARIAGE_UNCX, PREGNANCY_COMPLETE_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_COMPLETE_SEV_CX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_COMPLETE_UNCX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_COMPLETE_CX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_ONGOING_SEV_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_COMPLETE_UNCX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_ONGOING_CX:PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_ONGOING_SEV_CX == 1, 0, .x))) %>%
+  mutate(across(c(PREGNANCY_ONGOING_UNCX), 
+                ~if_else(PREGNANCY_ONGOING_CX == 1, 0, .x))) %>%
+  
+  # correct typos:
+  rename_with(~gsub("MISCARIAGE", "MISCARRIAGE", .x, fixed = TRUE), contains("MISCARIAGE")) %>% 
+  
+  ungroup()
+
+```
+
+## Mbr Level Cleaning
+
+Here we handle NAs, recode, and factor a lot of variables so they don't cause trouble in a dashboard. Also combining with the Member Level table we created from Joe's Member Monthly to bring in conditions, costs, etc.
+
+```{r}
+
+Static_Mbr_Level <- Static %>% 
+  
+  #Join with Mbr Level:
+  right_join(Mbr_Level, by = c("Mbr_ID" = "MEMBERID")) %>%
+  
+  #Create internet access category:
+  mutate(Internet_Access_County_Cat = case_when(Internet_Access_County < 20 ~ "Very Poor Broadband Access",
+                                                Internet_Access_County >= 20 & Internet_Access_County < 40 ~ "Poor Broadband Access",
+                                                Internet_Access_County >= 40 & Internet_Access_County < 60 ~ "Moderate Broadband Access",
+                                                Internet_Access_County >= 60 & Internet_Access_County < 80 ~ "Good Broadband Access",
+                                                Internet_Access_County >= 80  ~ "Very Good Broadband Access"
+                                                )) %>% 
+
+  relocate(Internet_Access_County_Cat, .after = Internet_Access_County) %>% 
+  
+  #Clean NAs by converting to "Missing"
+  mutate(across(c(Company_Name,
+                    Age_Cat, Generation, Age_Group,  
+                    Gender, Race, Race_Minority_Cat, 
+                    Rural_County_Cat, #County_Name, State,
+                    Mbr_County_Name, Mbr_State, 	
+                    Socioeconomic_SVI_Cat, Household_SVI_Cat, HousingTransp_SVI_Cat, Minority_SVI_Cat, All_SVI_Cat,
+                    Maternity_Desert_Cat, Internet_Access_County_Cat
+                  ), ~case_when(is.na(.x) ~ "Missing", TRUE~.x))) %>% 
+  
+  #Recode and factor vars:
+  mutate(Gender = recode(Gender, "F" = "Female", "M" = "Male"),
+         Gender = factor(Gender, levels = c("Female", "Male", "Missing")),
+         Mbr_State = recode(Mbr_State, "??" = "Missing"),
+         Generation = factor(Generation, levels = c('Gen Alpha', "Gen Z", "Millenials", "Gen X",
+                                                    "Boomers II", "Boomers I", "Post War", "WWII", "Missing")),
+         Age_Group = factor(Age_Group, levels = c('Age [>18]', "Age [19-30]","Age [31-40]","Age [41-50]","Age [51-60]", "Age [>60]",
+                                                  "Missing")),
+         Age_Cat = factor(Age_Cat, levels = c("Baby", "Child", "Young Child", "Teen", "Young Adult", "Adult","Senior","Missing")),
+         Race = recode(Race, "00" = "Missing"), 
+         Race = factor(Race, levels = c('Asian','Black',"Hispanic","Native American","White","Other", "Missing")),
+         Race_Minority_Cat = factor(Race_Minority_Cat, levels = c('Minority','Non-Minority', "Missing")),
+         Maternity_Desert_Cat = factor(Maternity_Desert_Cat, levels = c("Full Access", "Moderate Access", "Low Access", 
+                                                                        "Maternity Care Desert", "Missing")),
+         Rural_County_Cat = factor(Rural_County_Cat, levels = c('Very Rural',"Rural", "Metro", "Urban", "Major City", "Missing")),
+         Socioeconomic_SVI_Cat = factor(Socioeconomic_SVI_Cat, levels = c("Low", "Moderate", "High", "Very High", "Missing")),
+         Household_SVI_Cat  = factor(Household_SVI_Cat, levels = c("Low", "Moderate", "High", "Very High", "Missing")),
+         Minority_SVI_Cat = factor(Minority_SVI_Cat, levels = c("Low", "Moderate", "High", "Very High", "Missing")),
+         HousingTransp_SVI_Cat = factor(HousingTransp_SVI_Cat, levels = c("Low", "Moderate", "High", "Very High", "Missing")),
+         All_SVI_Cat = factor(All_SVI_Cat, levels = c("Low", "Moderate", "High", "Very High", "Missing")),
+         Internet_Access_County_Cat = factor(Internet_Access_County_Cat, 
+                                             levels = c("Very Poor Broadband Access", "Poor Broadband Access", "Moderate Broadband Access",
+                                             "Good Broadband Access", "Very Good Broadband Access"))) %>% 
+  
+  #Change all the distance to be whole numbers so the histogram is cleaner:
+  mutate(across(c(contains("Dist")), ~round(.x, digits = 0)))
+
+
+```
+
+### Checks
+
+This section is what we use to check whether variables used in our Main filters within our dashboard are complete. NAs in these columns cause the row (or overall member - when table is member level) to go missing from the dashboard. Check whether any variable filters that would apply to the whole table should be checked for NAs and cleaned with the code below. Add variables used as main filters to the summarise(across())
+
+```{r}
+
+# Checks on the important (main filters): 
+Static_Mbr_Level %>%  
+  summarize(across(c(Company_Name,
+                    Age, Age_Cat, Generation, Age_Group,  
+                    Gender, Race, Race_Minority_Cat, 
+                    Rural_County_Cat, #County_Name, State,
+                    Mbr_County_Name, Mbr_State, 	
+                    Socioeconomic_SVI_Cat, Household_SVI_Cat, HousingTransp_SVI_Cat, Minority_SVI_Cat, All_SVI_Cat,
+                    Maternity_Desert_Cat, Internet_Access_County_Cat
+                  ), ~ sum(is.na(.x)))) %>% 
+  pivot_longer(everything()) %>% 
+  arrange(desc(value))
+
+# Checks on the everything in the table:
+Static_Mbr_Level %>%  
+  summarize(across(everything(), ~ sum(is.na(.x)))) %>% 
+  pivot_longer(everything()) %>% 
+  arrange(desc(value))
+
+```
+
+Sometimes a variable is persistent, disobedient, and will not convert their NAs to "Missing"... such as the Age_Group var. This section is to handle these.
+
+```{r}
+
+Static_Mbr_Level <- Static_Mbr_Level %>% 
+  mutate(Age_Group = if_else(is.na(Age_Group), "Missing", Age_Group)) %>% 
+  mutate(Internet_Access_County_Cat = if_else(is.na(Internet_Access_County_Cat), "Missing", Internet_Access_County_Cat))
+
+```
+
+# BH Severity Estimation
+
+## Snowflake Connection
+
+Using Joe's CCSR table, VitalData's FinalClaimDetail (CPT table w/ dates) and FinalClaimsDetailCode (Diag table)
+
+```{r}
+
+con <- dbConnect(odbc::odbc(), "snowflakeodbc", UID = "SFK_SVC_PRD_POSIT")
+
+DBI::dbGetQuery(con, 'USE DATABASE PRD_DATASCIENCE_DB;')
+DBI::dbGetQuery(con, 'USE SCHEMA HEALTHECON;')
+
+df_VD_claims <- tbl(con, in_catalog('PRD_RAW_DB', 'VDT_CM', 'FINALCLAIMSDETAIL'))
+df_VD_diag <- tbl(con, in_catalog('PRD_RAW_DB', 'VDT_CM', 'FINALCLAIMSDETAILCODE'))
+df_CCSR_ref <- tbl(con, in_catalog('PRD_DATASCIENCE_DB', 'HEALTHECON', 'CCSR_WIDE_REF'))
+
+```
+
+```{r}
+
+# Filter Joe's table for the conditions in the BH category:
+df_CCSR_ref_BH <- df_CCSR_ref %>% 
+  select(ICD_CODE, contains("MBD")) 
+
+# Filter VitalData CPT table for desired members and bring in date:
+df_VD_claims_sum <- df_VD_claims %>% 
+  filter(MEMBERID %in% MBR_LIST$MEMBERID) %>% 
+  summarise(SVC_DATE = min(SERVICEFROMDATE), .by = c(MEMBERID, CLAIMNUMBER))
+
+# Bring in VitalData Diag table by claimnumber:
+df_VD_diag_join <- df_VD_claims_sum %>% 
+  inner_join(df_VD_diag, by = 'CLAIMNUMBER')
+
+# Merge Joe's table with the VitalData tables:
+df_VD_diag_join_CCSR <- df_VD_diag_join %>% 
+  inner_join(df_CCSR_ref_BH, by = c('CODEVALUE' = 'ICD_CODE'))
+  
+
+# Create month column and flag conditions so they appear only once for each month:  
+df_VD_diag_join_CCSR_monthly <- df_VD_diag_join_CCSR %>% 
+  mutate(MONTH = sql("DATE_TRUNC(MONTH, SVC_DATE)")) %>% 
+  summarise(across(MBD001_SCHIZOPHRENIA_SPECTRUM_PSYCHOTIC_DISORDERS:MBD034_MENTAL_SUBSTANCE_DISORDERS_SEQUELA, ~ max(.x)),
+            .by = c(MEMBERID, MONTH))
+
+```
+
+```{r}
+
+# Collect and create a universal BH flag for table:
+# Severity <- df_VD_diag_join_CCSR_monthly %>% 
+#   # Limiting the date range as well: 
+#   filter(MONTH >= start_date) %>% 
+#   collect() %>%
+#   mutate(BH_Condition = rowSums(across(c(MBD001_SCHIZOPHRENIA_SPECTRUM_PSYCHOTIC_DISORDERS:MBD034_MENTAL_SUBSTANCE_DISORDERS_SEQUELA)))) %>% 
+#   # Filter for BH_Condition greater than 1 to eliminate months with no BH condition:
+#   filter(BH_Condition >= 1) 
+
+# This part will bring it down to a member level:
+Severity <- df_VD_diag_join_CCSR_monthly %>% 
+  select(MEMBERID,
+         MBD001_SCHIZOPHRENIA_SPECTRUM_PSYCHOTIC_DISORDERS:MBD034_MENTAL_SUBSTANCE_DISORDERS_SEQUELA) %>%
+  mutate(across(MBD001_SCHIZOPHRENIA_SPECTRUM_PSYCHOTIC_DISORDERS:MBD034_MENTAL_SUBSTANCE_DISORDERS_SEQUELA,
+                ~if_else(is.na(.x),0,.x))) %>%
+  group_by(MEMBERID) %>%
+  summarise_all(~max(.x, na.rm = T)) %>%
+  ungroup() %>%
+  collect()
+  
+
+# Monthly table:
+# Severity_Monthly <- df_VD_diag_join_CCSR_monthly %>% 
+#   # Limiting the date range as well: 
+#   filter(MONTH >= start_date) %>% 
+#   collect() %>%
+#   mutate(BH_Condition = rowSums(
+#     across(c(MBD001_SCHIZOPHRENIA_SPECTRUM_PSYCHOTIC_DISORDERS:MBD034_MENTAL_SUBSTANCE_DISORDERS_SEQUELA)))
+#     ) %>% 
+#   filter(BH_Condition >= 1)
+  
+
+Severity
+Severity_Monthly
+
+summary(Severity_Monthly$MONTH)
+summary(Severity$SVC_DATE)
+```
+
+# Med Adherence Calculation
+
+## med adherence- all time
+
+```{r}
+# pharmacy tables
+FINALRX <- tbl(con, in_catalog('PRD_RAW_DB', 'VDT_CM', 'FINALRX'))
+PHARMACY_CG <- tbl(con, in_catalog('PRD_AR_INBOUND_DB', 'CEDAR_GATE', 'PHARMACY'))
+# reuse this Onduo member list
+MBR_LIST
+
+X <- FINALRX %>%
+  select(
+    MEMBERID,
+    CLAIMNUMBER, # add this as keys for later join
+    CLAIMLINENUMBER, # add this as keys for later join
+    SERVICEDATE,
+    DAYSSUPPLY,
+    WRITTENDATE,
+    REFILLCODE,
+    REFILLSAUTHORIZEDCOUNT,
+    DRUGPRODUCTNAME,NDCCODE,
+         GENERICPRODUCTID,
+         GENERICPRODUCTNAME
+  ) %>% 
+  inner_join(MBR_LIST, join_by('MEMBERID'=='MEMBERID'), copy = TRUE) %>%
+  left_join(
+    PHARMACY_CG %>% select(
+      MBR_ID,
+      SVC_DRUG_NAME,
+      SVC_RX_CLASS_DESC,
+      CHRONICQMDESCLIST,
+      SVC_NDC_CODE,
+      SOURCE_RX_GENERIC_BRAND_INDICATOR
+    ) %>% distinct() %>% inner_join(
+      MBR_LIST %>% select(MEMBERID),
+      join_by('MBR_ID' == 'MEMBERID'),
+      copy = TRUE
+    ),
+    join_by('NDCCODE' == 'SVC_NDC_CODE', 'MEMBERID' == 'MBR_ID')
+  )%>%
+  select(-c(
+    GENERICPRODUCTID,
+    GENERICPRODUCTNAME,
+    SOURCE_RX_GENERIC_BRAND_INDICATOR
+  )) %>%
+  collect %>% 
+  ungroup()
+
+X_final <- X %>%
+  group_by(MEMBERID,
+           DRUGPRODUCTNAME,
+           # NDCCODE,
+           # SVC_DRUG_NAME,
+           SVC_RX_CLASS_DESC) %>%
+  summarise(CHRONICQMDESCLIST_2 = paste(unique(CHRONICQMDESCLIST), collapse = ", ")) %>%
+  distinct()
+
+# cleaning
+X <- X %>% select(MEMBERID,DRUGPRODUCTNAME,SVC_RX_CLASS_DESC,WRITTENDATE,DAYSSUPPLY,REFILLCODE,REFILLSAUTHORIZEDCOUNT,SERVICEDATE) %>% group_by(MEMBERID,DRUGPRODUCTNAME,SVC_RX_CLASS_DESC,WRITTENDATE,REFILLCODE,
+# DAYSSUPPLY,REFILLSAUTHORIZEDCOUNT,
+SERVICEDATE) %>% summarise(
+  DAYSSUPPLY= max(DAYSSUPPLY),
+  REFILLSAUTHORIZEDCOUNT= max(REFILLSAUTHORIZEDCOUNT)
+
+) %>% ungroup()
+
+# member* drug class level
+ONDUO_MedAdherence_Rate_ByMbrDrugClass <- X %>% group_by(MEMBERID,
+           DRUGPRODUCTNAME,
+           SVC_RX_CLASS_DESC,
+           WRITTENDATE,
+           ) %>%
+  summarise(n = n_distinct(REFILLCODE),
+            m = max(REFILLSAUTHORIZEDCOUNT) + 1) %>%
+  ungroup() %>%
+  group_by(MEMBERID, 
+           SVC_RX_CLASS_DESC, 
+           WRITTENDATE
+           ) %>%
+  summarise(n = sum(n), m = sum(m)) %>%
+  mutate(n = if_else(n > m, m, n)) %>%
+  ungroup() %>%
+  group_by(MEMBERID, 
+           SVC_RX_CLASS_DESC
+           ) %>%
+  summarise(n = sum(n), m = sum(m)) %>%
+  mutate(MED_ADHERENCE_RATE = n / m,
+         Diab_Drug= ifelse(SVC_RX_CLASS_DESC=='Diabetic Therapy',1,0))
+# ONDUO_MedAdherence_Rate_ByMbrDrugClass: this is member * drug class level med adherence table
+
+
+
+
+
+
+```
+
+## med adherence- restricted time
+
+```{r}
+# restrict time around event (pre/post 6 months)
+
+
+
+
+```
+
+# Export
+
+## Name Conversion
+
+```{r}
+ONDUO_Dash_Main_Table <- ENROLLED_MBRS_ONDUO
+ONDUO_Dash_Population <- ID_ref
+
+ONDUO_Dash_Celeste_Programs <- Celeste_Programs
+
+ONDUO_Dash_Maternity <- Maternity
+
+ONDUO_Dash_CM_Monthly <- CM_Monthly
+
+ONDUO_Dash_BH_ER_Claims <- BH_ER_Claims
+ONDUO_Dash_BH_IP_Claims <- BH_IP_Claims
+ONDUO_Dash_General_ER_Claims <- General_ER_Claims
+ONDUO_Dash_General_IP_Claims <- General_IP_Claims
+
+ONDUO_Dash_Severity <- Severity
+#ONDUO_Dash_Severity_Monthly <- Severity_Monthly
+
+ONDUO_Dash_Mbr_Monthly <- Mbr_Monthly
+ONDUO_Dash_Static_Mbr_Level <- Static_Mbr_Level
+
+
+```
+
+```{r}
+remove(Maternity, CM_Monthly, Celeste_Programs,
+       BH_ER_Claims, BH_IP_Claims, General_ER_Claims, General_IP_Claims,
+       Severity, Severity_Monthly, 
+       Static, Static_Mbr_Level, Mbr_Monthly)
+```
+
+## Pins
+
+```{r}
+
+board <- pins::board_connect()
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Main_Table, 
+  description = "ONDUO dash main table",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Population, 
+  description = "2023-Current ONDUO population and all IDs (including Joe's Master_ID, which we will use to count unique mbrs) for dashboard.",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Celeste_Programs, 
+  description = "ONDUO members' Celeste Program participation.",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Maternity, 
+  description = "ONDUO members' Maternity table.",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_CM_Monthly, 
+  description = "ONDUO members' CM contacts and attempts.",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_BH_ER_Claims, 
+  description = "ONDUO BH ER claims between 1/2021 up to3 months ago",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_BH_IP_Claims, 
+  description = "ONDUO BH IP claims between 1/2021 up to 3 months ago",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_General_ER_Claims, 
+  description = "ONDUO ER claims (physical and BH) between 1/2021 up to 3 months ago",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_General_IP_Claims, 
+  description = "ONDUO IP claims (physical and BH) between 1/2021 up to 3 months ago",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Severity, 
+  description = "ONDUO members' BH diagnoses between 2021 to present",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Mbr_Monthly,
+  description = "ONDUO members' monthly level between 2016 to present",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_Dash_Static_Mbr_Level, 
+  description = "ONDUO members' Static w/ Joe's Member Monthly aggregated to a member level.",
+  type = 'parquet',
+  versioned =  TRUE
+)
+
+board %>% pins::pin_write(
+  ONDUO_MedAdherence_Rate_ByMbrDrugClass,
+  description = "ONDUO members med adherence by memberid * drug class, all times no restriction on time",
+  type = 'parquet',
+  versioned = TRUE
+)
+
+
+
+```
